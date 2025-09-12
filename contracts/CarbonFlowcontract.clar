@@ -301,3 +301,94 @@
     (ok true)
   )
 )
+
+
+;; read only functions
+
+;; Get project details
+(define-read-only (get-project (project-id uint))
+  (map-get? projects project-id)
+)
+
+;; Get user's carbon credit balance
+(define-read-only (get-user-balance (user principal))
+  (default-to u0 (map-get? user-balances user))
+)
+
+;; Get project credits for specific owner
+(define-read-only (get-project-credits (project-id uint) (owner principal))
+  (default-to u0 (map-get? project-credits { project-id: project-id, owner: owner }))
+)
+
+;; Get insurance pool details
+(define-read-only (get-insurance-pool (project-id uint))
+  (map-get? insurance-pool project-id)
+)
+
+;; Get reversal event details
+(define-read-only (get-reversal-event (project-id uint))
+  (map-get? reversal-events project-id)
+)
+
+;; Check if oracle is authorized
+(define-read-only (is-oracle-authorized (oracle principal))
+  (default-to false (map-get? authorized-oracles oracle))
+)
+
+;; Get total credits minted
+(define-read-only (get-total-credits-minted)
+  (var-get total-credits-minted)
+)
+
+;; Get total insurance pool value
+(define-read-only (get-total-insurance-pool)
+  (var-get total-insurance-pool)
+)
+
+;; Get next project ID
+(define-read-only (get-next-project-id)
+  (var-get next-project-id)
+)
+
+;; Get contract statistics
+(define-read-only (get-contract-stats)
+  {
+    total-projects: (- (var-get next-project-id) u1),
+    total-credits-minted: (var-get total-credits-minted),
+    total-insurance-pool: (var-get total-insurance-pool),
+    contract-admin: (var-get contract-admin)
+  }
+)
+
+;; private functions
+
+;; Calculate insurance premium based on project risk factors
+(define-private (calculate-insurance-premium (project-id uint) (base-amount uint))
+  (let (
+    (project (unwrap! (map-get? projects project-id) u0))
+    (risk-multiplier (if (is-eq (get project-type project) "forest") u12 u8)) ;; Higher risk for forests
+  )
+    (/ (* base-amount risk-multiplier) u10)
+  )
+)
+
+;; Validate geographic coordinates
+(define-private (validate-coordinates (lat-min int) (lat-max int) (lon-min int) (lon-max int))
+  (and
+    (and (>= lat-min -90000000) (<= lat-max 90000000))   ;; Valid latitude range (scaled by 1M)
+    (and (>= lon-min -180000000) (<= lon-max 180000000)) ;; Valid longitude range (scaled by 1M)
+    (< lat-min lat-max)
+    (< lon-min lon-max)
+  )
+)
+
+;; Calculate area from coordinates (simplified)
+(define-private (calculate-area (lat-min int) (lat-max int) (lon-min int) (lon-max int))
+  (let (
+    (lat-diff (to-uint (- lat-max lat-min)))
+    (lon-diff (to-uint (- lon-max lon-min)))
+  )
+    ;; Simplified area calculation (not accounting for Earth's curvature)
+    (/ (* lat-diff lon-diff) u1000000) ;; Convert to approximate square meters
+  )
+)
