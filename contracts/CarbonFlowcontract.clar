@@ -110,7 +110,7 @@
       project-type: project-type,
       status: "active",
       credits-minted: u0,
-      last-verification: block-height,
+      last-verification: stacks-block-height,
       insurance-covered: u0
     })
     
@@ -144,7 +144,7 @@
     ;; Update project data
     (map-set projects project-id (merge project {
       credits-minted: (+ (get credits-minted project) credits-to-mint),
-      last-verification: block-height
+      last-verification: stacks-block-height
     }))
     
     ;; Update user balance
@@ -245,7 +245,7 @@
     
     ;; Record reversal event
     (map-set reversal-events project-id {
-      block-height: block-height,
+      block-height: stacks-block-height,
       credits-lost: credits-lost,
       verified-by: tx-sender,
       compensation-paid: compensation-amount
