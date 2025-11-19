@@ -38,6 +38,19 @@
 (define-constant ERR_BLACKLISTED (err u117))
 (define-constant ERR_INVALID_INPUT (err u118))
 
+;; Security enhancements constants
+(define-constant EMERGENCY_WITHDRAWAL_DELAY u1008) ;; ~1 week in blocks
+(define-constant OWNERSHIP_TRANSFER_DELAY u144) ;; ~1 day in blocks
+(define-constant CIRCUIT_BREAKER_THRESHOLD u1000000000000) ;; 1M STX emergency threshold
+
+(define-constant ERR_EMERGENCY_ACTIVE (err u119))
+(define-constant ERR_TRANSFER_NOT_INITIATED (err u120))
+(define-constant ERR_TRANSFER_DELAY_ACTIVE (err u121))
+(define-constant ERR_EMERGENCY_NOT_ACTIVE (err u122))
+(define-constant ERR_TIMELOCK_ACTIVE (err u123))
+(define-constant ERR_CIRCUIT_BREAKER (err u124))
+(define-constant ERR_INVALID_TIMELOCK (err u125))
+
 (define-constant MIN_PROJECT_SIZE u1000) ;; Minimum 1000 square meters
 (define-constant INSURANCE_RATE u10) ;; 10% insurance rate
 (define-constant CREDITS_PER_TON u1000000) ;; 1 million micro-credits per ton CO2
@@ -54,6 +67,14 @@
 (define-data-var total-insurance-pool uint u0)
 (define-data-var contract-paused bool false)
 (define-data-var reentrancy-lock bool false)
+
+;; Security enhancement data vars
+(define-data-var emergency-mode bool false)
+(define-data-var pending-admin principal CONTRACT_OWNER)
+(define-data-var admin-transfer-time uint u0)
+(define-data-var emergency-withdrawal-time uint u0)
+(define-data-var circuit-breaker-active bool false)
+(define-data-var last-emergency-check uint u0)
 
 ;; data maps
 (define-map projects
@@ -116,6 +137,25 @@
 (define-map user-project-count
   principal
   uint
+)
+
+;; Security enhancement maps
+(define-map timelocks
+  (string-ascii 32) ;; operation-id
+  {
+    initiated-at: uint,
+    delay-blocks: uint,
+    authorized-by: principal
+  }
+)
+
+(define-map emergency-actions
+  (string-ascii 32) ;; action-id
+  {
+    executed: bool,
+    execution-time: uint,
+    authorized-by: principal
+  }
 )
 
 ;; Security helper functions
@@ -240,6 +280,174 @@
 )
 
 ;; public functions
+
+;; SECURITY ENHANCEMENT FUNCTIONS
+
+;; Initiate admin transfer (two-step process)
+(define-public (initiate-admin-transfer (new-admin principal))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+    (asserts! (not (is-eq new-admin (var-get contract-admin))) ERR_INVALID_INPUT)
+    (var-set pending-admin new-admin)
+    (var-set admin-transfer-time stacks-block-height)
+    (print { event: "admin-transfer-initiated", new-admin: new-admin, execution-block: (+ stacks-block-height OWNERSHIP_TRANSFER_DELAY) })
+    (ok true)
+  )
+)
+
+;; Complete admin transfer (after timelock)
+(define-public (complete-admin-transfer)
+  (let ((transfer-time (var-get admin-transfer-time)))
+    (asserts! (> transfer-time u0) ERR_TRANSFER_NOT_INITIATED)
+    (asserts! (>= stacks-block-height (+ transfer-time OWNERSHIP_TRANSFER_DELAY)) ERR_TRANSFER_DELAY_ACTIVE)
+    (asserts! (is-eq tx-sender (var-get pending-admin)) ERR_UNAUTHORIZED)
+    (var-set contract-admin (var-get pending-admin))
+    (var-set admin-transfer-time u0)
+    (print { event: "admin-transfer-completed", new-admin: (var-get contract-admin) })
+    (ok true)
+  )
+)
+
+;; Activate emergency mode (admin only)
+(define-public (activate-emergency-mode)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+    (asserts! (not (var-get emergency-mode)) ERR_EMERGENCY_ACTIVE)
+    (var-set emergency-mode true)
+    (var-set contract-paused true)
+    (var-set emergency-withdrawal-time stacks-block-height)
+    (print { event: "emergency-mode-activated", block: stacks-block-height })
+    (ok true)
+  )
+)
+
+;; Deactivate emergency mode (admin only)
+(define-public (deactivate-emergency-mode)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+    (asserts! (var-get emergency-mode) ERR_EMERGENCY_NOT_ACTIVE)
+    (var-set emergency-mode false)
+    (var-set contract-paused false)
+    (print { event: "emergency-mode-deactivated", block: stacks-block-height })
+    (ok true)
+  )
+)
+
+;; Emergency withdrawal (only after delay in emergency mode)
+(define-public (emergency-withdraw (amount uint) (recipient principal))
+  (let ((withdrawal-time (var-get emergency-withdrawal-time)))
+    (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+    (asserts! (var-get emergency-mode) ERR_EMERGENCY_NOT_ACTIVE)
+    (asserts! (>= stacks-block-height (+ withdrawal-time EMERGENCY_WITHDRAWAL_DELAY)) ERR_TIMELOCK_ACTIVE)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (try! (as-contract (stx-transfer? amount tx-sender recipient)))
+    (print { event: "emergency-withdrawal", amount: amount, recipient: recipient })
+    (ok true)
+  )
+)
+
+;; Activate circuit breaker if threshold exceeded
+(define-public (check-circuit-breaker)
+  (let ((pool-value (var-get total-insurance-pool)))
+    (if (and (>= pool-value CIRCUIT_BREAKER_THRESHOLD) (not (var-get circuit-breaker-active)))
+      (begin
+        (var-set circuit-breaker-active true)
+        (var-set contract-paused true)
+        (print { event: "circuit-breaker-activated", pool-value: pool-value })
+        (ok true)
+      )
+      (ok false)
+    )
+  )
+)
+
+;; Reset circuit breaker (admin only)
+(define-public (reset-circuit-breaker)
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-admin)) ERR_UNAUTHORIZED)
+    (asserts! (var-get circuit-breaker-active) ERR_INVALID_INPUT)
+    (var-set circuit-breaker-active false)
+    (var-set contract-paused false)
+    (print { event: "circuit-breaker-reset" })
+    (ok true)
+  )
+)
+
+;; Batch register multiple projects (gas optimization)
+(define-public (batch-register-projects (projects-data (list 10 {
+    lat-min: int,
+    lat-max: int,
+    lon-min: int,
+    lon-max: int,
+    area: uint,
+    project-type: (string-ascii 50)
+  })))
+  (begin
+    (try! (check-not-paused))
+    (try! (check-reentrancy))
+    (try! (check-blacklist tx-sender))
+    (let ((result (fold batch-register-helper projects-data (ok (list)))))
+      (release-reentrancy)
+      result
+    )
+  )
+)
+
+;; Helper for batch registration
+(define-private (batch-register-helper 
+  (project-data {
+    lat-min: int,
+    lat-max: int,
+    lon-min: int,
+    lon-max: int,
+    area: uint,
+    project-type: (string-ascii 50)
+  })
+  (acc (response (list 10 uint) uint)))
+  (match acc
+    success-list
+      (match (register-project-internal 
+               (get lat-min project-data)
+               (get lat-max project-data)
+               (get lon-min project-data)
+               (get lon-max project-data)
+               (get area project-data)
+               (get project-type project-data))
+        project-id (ok (unwrap! (as-max-len? (append success-list project-id) u10) ERR_INVALID_AMOUNT))
+        error (err error)
+      )
+    error (err error)
+  )
+)
+
+;; Internal project registration (for batch operations)
+(define-private (register-project-internal (lat-min int) (lat-max int) (lon-min int) (lon-max int) 
+                                           (area uint) (project-type (string-ascii 50)))
+  (let ((project-id (var-get next-project-id)))
+    (asserts! (and (< lat-min lat-max) (< lon-min lon-max)) ERR_INVALID_COORDINATES)
+    (asserts! (>= area MIN_PROJECT_SIZE) ERR_INVALID_AMOUNT)
+    (asserts! (validate-coordinates lat-min lat-max lon-min lon-max) ERR_INVALID_COORDINATES)
+    
+    (map-set projects project-id {
+      owner: tx-sender,
+      lat-min: lat-min,
+      lat-max: lat-max,
+      lon-min: lon-min,
+      lon-max: lon-max,
+      area: area,
+      project-type: project-type,
+      status: "active",
+      credits-minted: u0,
+      last-verification: stacks-block-height,
+      insurance-covered: u0
+    })
+    
+    (map-set project-credits { project-id: project-id, owner: tx-sender } u0)
+    (var-set next-project-id (unwrap! (safe-add project-id u1) ERR_OVERFLOW))
+    (update-user-project-count tx-sender true)
+    (ok project-id)
+  )
+)
 
 ;; Register a new carbon sequestration project
 (define-public (register-project (lat-min int) (lat-max int) (lon-min int) (lon-max int) 
@@ -627,8 +835,36 @@
     max-projects-per-user: MAX_PROJECTS_PER_USER,
     max-carbon-tons: MAX_CARBON_TONS,
     rate-limit-window: RATE_LIMIT_WINDOW,
-    max-actions-per-window: MAX_ACTIONS_PER_WINDOW
+    max-actions-per-window: MAX_ACTIONS_PER_WINDOW,
+    emergency-mode: (var-get emergency-mode),
+    circuit-breaker-active: (var-get circuit-breaker-active)
   }
+)
+
+;; Get admin transfer status
+(define-read-only (get-admin-transfer-status)
+  (ok {
+    current-admin: (var-get contract-admin),
+    pending-admin: (var-get pending-admin),
+    transfer-initiated-at: (var-get admin-transfer-time),
+    transfer-ready: (and 
+      (> (var-get admin-transfer-time) u0)
+      (>= stacks-block-height (+ (var-get admin-transfer-time) OWNERSHIP_TRANSFER_DELAY))
+    )
+  })
+)
+
+;; Get emergency status
+(define-read-only (get-emergency-status)
+  (ok {
+    emergency-mode: (var-get emergency-mode),
+    emergency-withdrawal-time: (var-get emergency-withdrawal-time),
+    withdrawal-ready: (and
+      (var-get emergency-mode)
+      (>= stacks-block-height (+ (var-get emergency-withdrawal-time) EMERGENCY_WITHDRAWAL_DELAY))
+    ),
+    circuit-breaker-active: (var-get circuit-breaker-active)
+  })
 )
 
 ;; private functions
